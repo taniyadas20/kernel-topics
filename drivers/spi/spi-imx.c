@@ -673,7 +673,7 @@ static int mx51_ecspi_prepare_message(struct spi_imx_data *spi_imx,
 	 * propagate into the hardware. It takes exactly one tick of the
 	 * SCLK clock, but we will wait two SCLK clock just to be sure. The
 	 * effect of the delay it takes for the hardware to apply changes
-	 * is noticable if the SCLK clock run very slow. In such a case, if
+	 * is noticeable if the SCLK clock run very slow. In such a case, if
 	 * the polarity of SCLK should be inverted, the GPIO ChipSelect might
 	 * be asserted before the SCLK polarity changes, which would disrupt
 	 * the SPI communication as the device on the other end would consider
@@ -1382,9 +1382,7 @@ static int spi_imx_setupxfer(struct spi_device *spi,
 		spi_imx->target_burst = t->len;
 	}
 
-	spi_imx->devtype_data->prepare_transfer(spi_imx, spi, t);
-
-	return 0;
+	return spi_imx->devtype_data->prepare_transfer(spi_imx, spi, t);
 }
 
 static void spi_imx_sdma_exit(struct spi_imx_data *spi_imx)
@@ -1469,8 +1467,8 @@ static int spi_imx_calculate_timeout(struct spi_imx_data *spi_imx, int size)
 static void spi_imx_dma_unmap(struct spi_imx_data *spi_imx,
 			      struct dma_data_package *dma_data)
 {
-	struct device *tx_dev = spi_imx->controller->dma_tx->device->dev;
-	struct device *rx_dev = spi_imx->controller->dma_rx->device->dev;
+	struct device *tx_dev = dmaengine_get_dma_device(spi_imx->controller->dma_tx);
+	struct device *rx_dev = dmaengine_get_dma_device(spi_imx->controller->dma_rx);
 
 	dma_unmap_single(tx_dev, dma_data->dma_tx_addr,
 			 DMA_CACHE_ALIGNED_LEN(dma_data->dma_len),
@@ -1528,8 +1526,8 @@ static int spi_imx_dma_map(struct spi_imx_data *spi_imx,
 			   struct dma_data_package *dma_data)
 {
 	struct spi_controller *controller = spi_imx->controller;
-	struct device *tx_dev = controller->dma_tx->device->dev;
-	struct device *rx_dev = controller->dma_rx->device->dev;
+	struct device *tx_dev = dmaengine_get_dma_device(controller->dma_tx);
+	struct device *rx_dev = dmaengine_get_dma_device(controller->dma_rx);
 	int ret;
 
 	dma_data->dma_tx_addr = dma_map_single(tx_dev, dma_data->dma_tx_buf,
@@ -1580,11 +1578,13 @@ static int spi_imx_dma_tx_data_handle(struct spi_imx_data *spi_imx,
 		dma_data->dma_len = ALIGN(dma_data->data_len, BYTES_PER_32BITS_WORD);
 	}
 
-	dma_data->dma_tx_buf = kzalloc(dma_data->dma_len, GFP_KERNEL);
+	dma_data->dma_tx_buf = kzalloc(DMA_CACHE_ALIGNED_LEN(dma_data->dma_len),
+				       GFP_KERNEL);
 	if (!dma_data->dma_tx_buf)
 		return -ENOMEM;
 
-	dma_data->dma_rx_buf = kzalloc(dma_data->dma_len, GFP_KERNEL);
+	dma_data->dma_rx_buf = kzalloc(DMA_CACHE_ALIGNED_LEN(dma_data->dma_len),
+				       GFP_KERNEL);
 	if (!dma_data->dma_rx_buf) {
 		kfree(dma_data->dma_tx_buf);
 		return -ENOMEM;
@@ -1709,6 +1709,7 @@ static int spi_imx_dma_data_prepare(struct spi_imx_data *spi_imx,
 			kfree(spi_imx->dma_data[0].dma_tx_buf);
 			kfree(spi_imx->dma_data[0].dma_rx_buf);
 			kfree(spi_imx->dma_data);
+			return ret;
 		}
 	}
 
@@ -1775,8 +1776,8 @@ static int spi_imx_dma_submit(struct spi_imx_data *spi_imx,
 							transfer_timeout);
 		if (!time_left) {
 			dev_err(spi_imx->dev, "I/O Error in DMA TX\n");
-			dmaengine_terminate_all(controller->dma_tx);
-			dmaengine_terminate_all(controller->dma_rx);
+			dmaengine_terminate_sync(controller->dma_tx);
+			dmaengine_terminate_sync(controller->dma_rx);
 			return -ETIMEDOUT;
 		}
 
@@ -1785,7 +1786,7 @@ static int spi_imx_dma_submit(struct spi_imx_data *spi_imx,
 		if (!time_left) {
 			dev_err(&controller->dev, "I/O Error in DMA RX\n");
 			spi_imx->devtype_data->reset(spi_imx);
-			dmaengine_terminate_all(controller->dma_rx);
+			dmaengine_terminate_sync(controller->dma_rx);
 			return -ETIMEDOUT;
 		}
 	} else {
@@ -1794,15 +1795,15 @@ static int spi_imx_dma_submit(struct spi_imx_data *spi_imx,
 		if (wait_for_completion_interruptible(&spi_imx->dma_tx_completion) ||
 		    READ_ONCE(spi_imx->target_aborted)) {
 			dev_dbg(spi_imx->dev, "I/O Error in DMA TX interrupted\n");
-			dmaengine_terminate_all(controller->dma_tx);
-			dmaengine_terminate_all(controller->dma_rx);
+			dmaengine_terminate_sync(controller->dma_tx);
+			dmaengine_terminate_sync(controller->dma_rx);
 			return -EINTR;
 		}
 
 		if (wait_for_completion_interruptible(&spi_imx->dma_rx_completion) ||
 		    READ_ONCE(spi_imx->target_aborted)) {
 			dev_dbg(spi_imx->dev, "I/O Error in DMA RX interrupted\n");
-			dmaengine_terminate_all(controller->dma_rx);
+			dmaengine_terminate_sync(controller->dma_rx);
 			return -EINTR;
 		}
 
@@ -1819,9 +1820,9 @@ static int spi_imx_dma_submit(struct spi_imx_data *spi_imx,
 	return 0;
 
 dmaengine_terminate_tx:
-	dmaengine_terminate_all(controller->dma_tx);
+	dmaengine_terminate_sync(controller->dma_tx);
 dmaengine_terminate_rx:
-	dmaengine_terminate_all(controller->dma_rx);
+	dmaengine_terminate_sync(controller->dma_rx);
 
 	return -EINVAL;
 }
@@ -1836,7 +1837,7 @@ static void spi_imx_dma_max_wml_find(struct spi_imx_data *spi_imx,
 	unsigned int i;
 
 	for (i = spi_imx->devtype_data->fifo_size / 2; i > 0; i--) {
-		if (!dma_data->dma_len % (i * bytes_per_word))
+		if (!(dma_data->dma_len % (i * bytes_per_word)))
 			break;
 	}
 	/* Use 1 as wml in case no available burst length got */
@@ -1920,8 +1921,9 @@ static int spi_imx_dma_package_transfer(struct spi_imx_data *spi_imx,
 		return ret;
 
 	/* Trim the DMA RX buffer and copy the actual data to rx_buf */
-	dma_sync_single_for_cpu(controller->dma_rx->device->dev, dma_data->dma_rx_addr,
-				dma_data->dma_len, DMA_FROM_DEVICE);
+	dma_sync_single_for_cpu(dmaengine_get_dma_device(controller->dma_rx), dma_data->dma_rx_addr,
+				DMA_CACHE_ALIGNED_LEN(dma_data->dma_len),
+				DMA_FROM_DEVICE);
 	spi_imx_dma_rx_data_handle(spi_imx, dma_data, transfer->rx_buf + spi_imx->rx_offset,
 				   word_delay);
 	spi_imx->rx_offset += dma_data->data_len;
@@ -2153,7 +2155,8 @@ static int spi_imx_transfer_one(struct spi_controller *controller,
 	if (spi_imx->usedma) {
 		ret = spi_imx_dma_transfer(spi_imx, transfer);
 		if (transfer->error & SPI_TRANS_FAIL_NO_START) {
-			spi_imx->usedma = false;
+			controller->fallback = true;
+			spi_imx_setupxfer(spi, transfer);
 			if (spi_imx->target_mode)
 				return spi_imx_pio_transfer_target(spi, transfer);
 			else

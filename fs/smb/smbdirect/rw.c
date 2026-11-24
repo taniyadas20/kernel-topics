@@ -143,7 +143,6 @@ int smbdirect_connection_rdma_xmit(struct smbdirect_socket *sc,
 		if (desc_buf_len > buf_len) {
 			desc_buf_len = buf_len;
 			desc[i].length = cpu_to_le32(desc_buf_len);
-			buf_len = 0;
 		}
 
 		credits_needed += smbdirect_connection_calc_rw_credits(sc,
@@ -252,4 +251,4 @@ free_msg:
 	kfree(msg);
 	goto out;
 }
-__SMBDIRECT_EXPORT_SYMBOL__(smbdirect_connection_rdma_xmit);
+EXPORT_SYMBOL_GPL(smbdirect_connection_rdma_xmit);

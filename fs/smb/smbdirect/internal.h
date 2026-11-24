@@ -6,11 +6,11 @@
 #ifndef __FS_SMB_COMMON_SMBDIRECT_INTERNAL_H__
 #define __FS_SMB_COMMON_SMBDIRECT_INTERNAL_H__
 
+#define DEFAULT_SYMBOL_NAMESPACE "SMBDIRECT"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#include "smbdirect.h"
+#include <linux/smbdirect.h>
 #include "pdu.h"
-#include "public.h"
 
 #include <linux/mutex.h>
 
@@ -73,6 +73,8 @@ void __smbdirect_socket_schedule_cleanup(struct smbdirect_socket *sc,
 } while (0)
 
 void smbdirect_socket_destroy_sync(struct smbdirect_socket *sc);
+
+void smbdirect_listen_orphan_socket(struct smbdirect_socket *sc);
 
 int smbdirect_socket_wait_for_credits(struct smbdirect_socket *sc,
 				      enum smbdirect_socket_status expected_status,

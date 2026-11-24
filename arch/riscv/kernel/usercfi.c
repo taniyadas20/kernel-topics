@@ -15,6 +15,7 @@
 #include <linux/syscalls.h>
 #include <linux/prctl.h>
 #include <asm/csr.h>
+#include <asm/switch_to.h>
 #include <asm/usercfi.h>
 
 unsigned long riscv_nousercfi __read_mostly;
@@ -66,12 +67,7 @@ void set_shstk_status(struct task_struct *task, bool enable)
 
 	task->thread_info.user_cfi_state.ubcfi_en = enable ? 1 : 0;
 
-	if (enable)
-		task->thread.envcfg |= ENVCFG_SSE;
-	else
-		task->thread.envcfg &= ~ENVCFG_SSE;
-
-	csr_write(CSR_ENVCFG, task->thread.envcfg);
+	envcfg_update_bits(task, ENVCFG_SSE, enable ? ENVCFG_SSE : 0);
 }
 
 void set_shstk_lock(struct task_struct *task, bool lock)
@@ -96,12 +92,7 @@ void set_indir_lp_status(struct task_struct *task, bool enable)
 
 	task->thread_info.user_cfi_state.ufcfi_en = enable ? 1 : 0;
 
-	if (enable)
-		task->thread.envcfg |= ENVCFG_LPE;
-	else
-		task->thread.envcfg &= ~ENVCFG_LPE;
-
-	csr_write(CSR_ENVCFG, task->thread.envcfg);
+	envcfg_update_bits(task, ENVCFG_LPE, enable ? ENVCFG_LPE : 0);
 }
 
 void set_indir_lp_lock(struct task_struct *task, bool lock)
@@ -109,15 +100,16 @@ void set_indir_lp_lock(struct task_struct *task, bool lock)
 	task->thread_info.user_cfi_state.ufcfi_locked = lock;
 }
 /*
- * If size is 0, then to be compatible with regular stack we want it to be as big as
- * regular stack. Else PAGE_ALIGN it and return back
+ * The shadow stack only stores the return address and not any variables
+ * 512M should be more than sufficient for most applications.
+ * Else PAGE_ALIGN it and return back
  */
 static unsigned long calc_shstk_size(unsigned long size)
 {
 	if (size)
 		return PAGE_ALIGN(size);
 
-	return PAGE_ALIGN(min_t(unsigned long long, rlimit(RLIMIT_STACK), SZ_4G));
+	return PAGE_ALIGN(min(rlimit(RLIMIT_STACK) / 8, SZ_512M));
 }
 
 /*
@@ -205,10 +197,13 @@ int save_user_shstk(struct task_struct *tsk, unsigned long *saved_shstk_ptr)
  */
 int restore_user_shstk(struct task_struct *tsk, unsigned long shstk_ptr)
 {
+	unsigned long __user *token_ptr = (unsigned long __user *)shstk_ptr;
 	unsigned long token = 0;
 
-	token = amo_user_shstk((unsigned long __user *)shstk_ptr, 0);
+	if (!access_ok(token_ptr, sizeof(token)))
+		return -EFAULT;
 
+	token = amo_user_shstk(token_ptr, 0);
 	if (token == -1)
 		return -EFAULT;
 
@@ -466,6 +461,9 @@ int arch_prctl_set_branch_landing_pad_state(struct task_struct *t, unsigned long
 	if (!is_user_lpad_enabled())
 		return -EINVAL;
 
+	if (state & ~PR_CFI_SUPPORTED_STATUS_MASK)
+		return -EINVAL;
+
 	/* indirect branch tracking is locked and further can't be modified by user */
 	if (is_indir_lp_locked(t))
 		return -EINVAL;
@@ -521,9 +519,8 @@ static int __init setup_global_riscv_enable(char *str)
 
 	if (riscv_nousercfi)
 		pr_info("RISC-V user CFI disabled via cmdline - shadow stack status : %s, landing pad status : %s\n",
-			(riscv_nousercfi & CMDLINE_DISABLE_RISCV_USERCFI_BCFI) ? "disabled" :
-			"enabled", (riscv_nousercfi & CMDLINE_DISABLE_RISCV_USERCFI_FCFI) ?
-			"disabled" : "enabled");
+			str_disabled_enabled(riscv_nousercfi & CMDLINE_DISABLE_RISCV_USERCFI_BCFI),
+			str_disabled_enabled(riscv_nousercfi & CMDLINE_DISABLE_RISCV_USERCFI_FCFI));
 
 	return 1;
 }

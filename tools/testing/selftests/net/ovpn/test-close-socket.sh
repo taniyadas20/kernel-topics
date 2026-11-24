@@ -37,6 +37,8 @@ ovpn_prepare_network() {
 		ovpn_cmd_ok "register peer${p} in overlay" ovpn_add_peer "${p}"
 	done
 
+	ovpn_cmd_ok "wait for server-side key setup" ovpn_wait_tcp_keys
+
 	for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "set peer0 timeout for peer ${p}" \
@@ -53,7 +55,7 @@ ovpn_run_ping_traffic() {
 
 	for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 		ovpn_cmd_ok "send ping traffic to peer ${p}" \
-			ip netns exec ovpn_peer0 ping -qfc 500 -w 3 \
+			ip netns exec ovpn_peer0 ping -qfc 100 -w 3 \
 				5.5.5.$((p + 1))
 	done
 }

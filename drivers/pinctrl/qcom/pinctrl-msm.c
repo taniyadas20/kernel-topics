@@ -39,6 +39,31 @@
 #define MAX_NR_TILES 4
 #define PS_HOLD_OFFSET 0x820
 
+/*
+ * Driver specific pinconf parameter to hand a pin over to its eGPIO owner
+ * without muxing the TLMM away to the virtual eGPIO function. The eGPIO
+ * present bit only describes whether a pin is capable of being owned
+ * remotely; ownership itself is independent of the selected mux function,
+ * so a pin can keep its normal function selected while being owned by the
+ * remote subsystem.
+ *
+ * The "remote-owned" property is a boolean flag: its mere presence releases
+ * the pin to the remote owner. The default value below is what makes a
+ * valueless property come out as "release", as pinconf-generic falls back to
+ * it whenever the property carries no value.
+ */
+#define PIN_CONFIG_REMOTE_OWNED	(PIN_CONFIG_END + 1)
+
+static const struct pinconf_generic_params msm_gpio_bindings[] = {
+	{ "qcom,remote-owned", PIN_CONFIG_REMOTE_OWNED, 1 },
+};
+
+#ifdef CONFIG_DEBUG_FS
+static const struct pin_config_item msm_conf_items[] = {
+	PCONFDUMP(PIN_CONFIG_REMOTE_OWNED, "qcom,remote-owned", NULL, false),
+};
+#endif
+
 /**
  * struct msm_pinctrl - state for a pinctrl-msm device
  * @dev:            device handle.
@@ -316,6 +341,10 @@ static int msm_config_reg(struct msm_pinctrl *pctrl,
 		*bit = g->oe_bit;
 		*mask = 1;
 		break;
+	case PIN_CONFIG_REMOTE_OWNED:
+		*bit = g->egpio_enable;
+		*mask = 1;
+		break;
 	default:
 		return -ENOTSUPP;
 	}
@@ -411,6 +440,17 @@ static int msm_config_group_get(struct pinctrl_dev *pctldev,
 	case PIN_CONFIG_OUTPUT_ENABLE:
 		if (!arg)
 			return -EINVAL;
+		break;
+	case PIN_CONFIG_REMOTE_OWNED:
+		/* Pin is not eGPIO capable */
+		if (!pctrl->soc->egpio_func || !(val & BIT(g->egpio_present)))
+			return -ENOTSUPP;
+
+		/* The enable bit is cleared when the remote owns the pin */
+		if (arg)
+			return -EINVAL;
+
+		arg = 1;
 		break;
 	default:
 		return -ENOTSUPP;
@@ -524,6 +564,29 @@ static int msm_config_group_set(struct pinctrl_dev *pctldev,
 		case PIN_CONFIG_OUTPUT_ENABLE:
 			arg = !!arg;
 			break;
+		case PIN_CONFIG_REMOTE_OWNED:
+			if (!pctrl->soc->egpio_func)
+				return -ENOTSUPP;
+
+			/*
+			 * Ownership may only be handed over on eGPIO capable
+			 * pins and is released by clearing the enable bit, so
+			 * this is applied here rather than through the generic
+			 * read-modify-write below.
+			 */
+			raw_spin_lock_irqsave(&pctrl->lock, flags);
+			val = msm_readl_ctl(pctrl, g);
+			if (!(val & BIT(g->egpio_present))) {
+				raw_spin_unlock_irqrestore(&pctrl->lock, flags);
+				dev_err(pctrl->dev, "%s is not eGPIO capable\n",
+					g->grp.name);
+				return -ENOTSUPP;
+			}
+
+			val &= ~BIT(g->egpio_enable);
+			msm_writel_ctl(val, pctrl, g);
+			raw_spin_unlock_irqrestore(&pctrl->lock, flags);
+			continue;
 		default:
 			dev_err(pctrl->dev, "Unsupported config parameter: %x\n",
 				param);
@@ -664,7 +727,7 @@ static void msm_gpio_dbg_show_one(struct seq_file *s,
 	int drive;
 	int pull;
 	int val;
-	int egpio_enable;
+	bool remote_owned;
 	u32 ctl_reg, io_reg;
 
 	static const char * const pulls_keeper[] = {
@@ -691,19 +754,14 @@ static void msm_gpio_dbg_show_one(struct seq_file *s,
 	func = (ctl_reg >> g->mux_bit) & 7;
 	drive = (ctl_reg >> g->drv_bit) & 7;
 	pull = (ctl_reg >> g->pull_bit) & 3;
-	egpio_enable = 0;
+	remote_owned = false;
 	if (pctrl->soc->egpio_func && ctl_reg & BIT(g->egpio_present))
-		egpio_enable = !(ctl_reg & BIT(g->egpio_enable));
+		remote_owned = !(ctl_reg & BIT(g->egpio_enable));
 
 	if (is_out)
 		val = !!(io_reg & BIT(g->out_bit));
 	else
 		val = !!(io_reg & BIT(g->in_bit));
-
-	if (egpio_enable) {
-		seq_printf(s, " %-8s: egpio\n", g->grp.name);
-		return;
-	}
 
 	seq_printf(s, " %-8s: %-3s", g->grp.name, is_out ? "out" : "in");
 	seq_printf(s, " %-4s func%d", str_high_low(val), func);
@@ -712,6 +770,8 @@ static void msm_gpio_dbg_show_one(struct seq_file *s,
 		seq_printf(s, " %s", pulls_no_keeper[pull]);
 	else
 		seq_printf(s, " %s", pulls_keeper[pull]);
+	if (remote_owned)
+		seq_puts(s, " remote-owned");
 	seq_puts(s, "\n");
 }
 
@@ -810,8 +870,7 @@ static const struct gpio_chip msm_gpio_template = {
  * Algorithm comes from Google's msmgpio driver.
  */
 static void msm_gpio_update_dual_edge_pos(struct msm_pinctrl *pctrl,
-					  const struct msm_pingroup *g,
-					  struct irq_data *d)
+					  const struct msm_pingroup *g)
 {
 	int loop_limit = 100;
 	unsigned val, val2, intstat;
@@ -995,6 +1054,16 @@ static void msm_gpio_irq_ack(struct irq_data *d)
 	if (test_bit(d->hwirq, pctrl->skip_wake_irqs)) {
 		if (test_bit(d->hwirq, pctrl->dual_edge_irqs))
 			msm_gpio_update_dual_edge_parent(d);
+
+		/*
+		 * During early initialization of the IRQ hierarchy,
+		 * irq_ack() is called by __irq_set_handler() before
+		 * the parent IRQ chip has been set up. This is why
+		 * we additionally need to check for d->parent_data->chip.
+		 */
+
+		if (d->parent_data->chip && d->parent_data->chip->irq_ack)
+			irq_chip_ack_parent(d);
 		return;
 	}
 
@@ -1005,17 +1074,15 @@ static void msm_gpio_irq_ack(struct irq_data *d)
 	msm_ack_intr_status(pctrl, g);
 
 	if (test_bit(d->hwirq, pctrl->dual_edge_irqs))
-		msm_gpio_update_dual_edge_pos(pctrl, g, d);
+		msm_gpio_update_dual_edge_pos(pctrl, g);
 
 	raw_spin_unlock_irqrestore(&pctrl->lock, flags);
 }
 
 static void msm_gpio_irq_eoi(struct irq_data *d)
 {
-	d = d->parent_data;
-
-	if (d)
-		d->chip->irq_eoi(d);
+	if (d->parent_data)
+		irq_chip_eoi_parent(d);
 }
 
 static bool msm_gpio_needs_dual_edge_parent_workaround(struct irq_data *d,
@@ -1036,8 +1103,6 @@ static void msm_gpio_irq_init_valid_mask(struct gpio_chip *gc,
 	struct msm_pinctrl *pctrl = gpiochip_get_data(gc);
 	const struct msm_pingroup *g;
 	int i;
-
-	bitmap_fill(valid_mask, ngpios);
 
 	for (i = 0; i < ngpios; i++) {
 		g = &pctrl->soc->groups[i];
@@ -1069,7 +1134,10 @@ static int msm_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 
 	if (test_bit(d->hwirq, pctrl->skip_wake_irqs)) {
 		clear_bit(d->hwirq, pctrl->dual_edge_irqs);
-		irq_set_handler_locked(d, handle_fasteoi_irq);
+		if (type & IRQ_TYPE_LEVEL_MASK)
+			irq_set_handler_locked(d, handle_fasteoi_irq);
+		else
+			irq_set_handler_locked(d, handle_fasteoi_ack_irq);
 		return 0;
 	}
 
@@ -1179,13 +1247,13 @@ static int msm_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 		msm_ack_intr_status(pctrl, g);
 
 	if (test_bit(d->hwirq, pctrl->dual_edge_irqs))
-		msm_gpio_update_dual_edge_pos(pctrl, g, d);
+		msm_gpio_update_dual_edge_pos(pctrl, g);
 
 	raw_spin_unlock_irqrestore(&pctrl->lock, flags);
 
-	if (type & (IRQ_TYPE_LEVEL_LOW | IRQ_TYPE_LEVEL_HIGH))
+	if (type & IRQ_TYPE_LEVEL_MASK)
 		irq_set_handler_locked(d, handle_level_irq);
-	else if (type & (IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_EDGE_RISING))
+	else if (type & IRQ_TYPE_EDGE_BOTH)
 		irq_set_handler_locked(d, handle_edge_irq);
 
 	return 0;
@@ -1242,12 +1310,12 @@ static int msm_gpio_irq_reqres(struct irq_data *d)
 	/*
 	 * If the wakeup_enable bit is present and marked as available for the
 	 * requested GPIO, it should be enabled when the GPIO is marked as
-	 * wake irq in order to allow the interrupt event to be transfered to
-	 * the PDC HW.
+	 * wake irq in order to allow the interrupt event to be transferred to
+	 * the PDC/MPM HW.
 	 * While the name implies only the wakeup event, it's also required for
 	 * the interrupt event.
 	 */
-	if (test_bit(d->hwirq, pctrl->skip_wake_irqs) && g->intr_wakeup_present_bit) {
+	if (g->intr_wakeup_present_bit) {
 		u32 intr_cfg;
 
 		raw_spin_lock_irqsave(&pctrl->lock, flags);
@@ -1275,7 +1343,7 @@ static void msm_gpio_irq_relres(struct irq_data *d)
 	unsigned long flags;
 
 	/* Disable the wakeup_enable bit if it has been set in msm_gpio_irq_reqres() */
-	if (test_bit(d->hwirq, pctrl->skip_wake_irqs) && g->intr_wakeup_present_bit) {
+	if (g->intr_wakeup_present_bit) {
 		u32 intr_cfg;
 
 		raw_spin_lock_irqsave(&pctrl->lock, flags);
@@ -1303,6 +1371,43 @@ static int msm_gpio_irq_set_affinity(struct irq_data *d,
 		return irq_chip_set_affinity_parent(d, dest, force);
 
 	return -EINVAL;
+}
+
+static int msm_gpio_irq_set_irqchip_state(struct irq_data *d,
+					  enum irqchip_irq_state which, bool val)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct msm_pinctrl *pctrl = gpiochip_get_data(gc);
+	const struct msm_pingroup *g = &pctrl->soc->groups[d->hwirq];
+
+	if (which != IRQCHIP_STATE_PENDING)
+		return -EINVAL;
+
+	if (test_bit(d->hwirq, pctrl->skip_wake_irqs))
+		return -EINVAL;
+
+	msm_writel_intr_status(val, pctrl, g);
+
+	return 0;
+}
+
+static int msm_gpio_irq_get_irqchip_state(struct irq_data *d,
+					  enum irqchip_irq_state which, bool *val)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct msm_pinctrl *pctrl = gpiochip_get_data(gc);
+	const struct msm_pingroup *g = &pctrl->soc->groups[d->hwirq];
+
+	if (which != IRQCHIP_STATE_PENDING)
+		return -EINVAL;
+
+	if (test_bit(d->hwirq, pctrl->skip_wake_irqs))
+		return -EINVAL;
+
+	g = &pctrl->soc->groups[d->hwirq];
+	*val = msm_readl_intr_status(pctrl, g);
+
+	return 0;
 }
 
 static int msm_gpio_irq_set_vcpu_affinity(struct irq_data *d, void *vcpu_info)
@@ -1393,6 +1498,8 @@ static const struct irq_chip msm_gpio_irq_chip = {
 	.irq_request_resources	= msm_gpio_irq_reqres,
 	.irq_release_resources	= msm_gpio_irq_relres,
 	.irq_set_affinity	= msm_gpio_irq_set_affinity,
+	.irq_set_irqchip_state = msm_gpio_irq_set_irqchip_state,
+	.irq_get_irqchip_state = msm_gpio_irq_get_irqchip_state,
 	.irq_set_vcpu_affinity	= msm_gpio_irq_set_vcpu_affinity,
 	.flags			= (IRQCHIP_MASK_ON_SUSPEND |
 				   IRQCHIP_SET_TYPE_MASKED |
@@ -1592,12 +1699,17 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 	pctrl->desc.name = dev_name(&pdev->dev);
 	pctrl->desc.pins = pctrl->soc->pins;
 	pctrl->desc.npins = pctrl->soc->npins;
+	pctrl->desc.num_custom_params = ARRAY_SIZE(msm_gpio_bindings);
+	pctrl->desc.custom_params = msm_gpio_bindings;
+#ifdef CONFIG_DEBUG_FS
+	pctrl->desc.custom_conf_items = msm_conf_items;
+#endif
 
-	pctrl->pctrl = devm_pinctrl_register(&pdev->dev, &pctrl->desc, pctrl);
-	if (IS_ERR(pctrl->pctrl)) {
-		dev_err(&pdev->dev, "Couldn't register pinctrl driver\n");
-		return PTR_ERR(pctrl->pctrl);
-	}
+	ret = devm_pinctrl_register_and_init(&pdev->dev, &pctrl->desc,
+					     pctrl, &pctrl->pctrl);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "Couldn't register pinctrl driver\n");
 
 	for (i = 0; i < soc_data->nfunctions; i++) {
 		func = &soc_data->functions[i];
@@ -1606,6 +1718,11 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 		if (ret < 0)
 			return ret;
 	}
+
+	ret = pinctrl_enable(pctrl->pctrl);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "Couldn't enable pinctrl driver\n");
 
 	ret = msm_gpio_init(pctrl);
 	if (ret)

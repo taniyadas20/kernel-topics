@@ -97,6 +97,10 @@ struct xe_tile {
 		 * Only main GT has page reclaim list allocations.
 		 */
 		struct xe_sa_manager *reclaim_pool;
+#if IS_ENABLED(CONFIG_DRM_XE_DEBUG_MEM)
+		/** @mem.memtest_bo: VRAM overlap check BO */
+		struct xe_bo *memtest_bo;
+#endif
 	} mem;
 
 	/** @sriov: tile level virtualization data */
@@ -106,8 +110,6 @@ struct xe_tile {
 			struct xe_lmtt lmtt;
 		} pf;
 		struct {
-			/** @sriov.vf.ggtt_balloon: GGTT regions excluded from use. */
-			struct xe_ggtt_node *ggtt_balloon[2];
 			/** @sriov.vf.self_config: VF configuration data */
 			struct xe_tile_sriov_vf_selfconfig self_config;
 		} vf;

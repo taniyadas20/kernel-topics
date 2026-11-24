@@ -60,7 +60,7 @@ __noinline int exception_cb_ok_arg_small(int a)
 
 SEC("?tc")
 __exception_cb(exception_cb_bad_ret_type1)
-__failure __msg("Global function exception_cb_bad_ret_type1() return value not void or scalar.")
+__failure __msg("Only void, scalar, arena pointer, or a struct/union of scalars and arena pointers up to 16 bytes is supported.")
 int reject_exception_cb_type_1(struct __sk_buff *ctx)
 {
 	bpf_throw(0);
@@ -205,6 +205,28 @@ int reject_with_reference(void *ctx)
 	if (!f)
 		return 0;
 	bpf_throw(0);
+	return 0;
+}
+
+__noinline int global_subprog_may_throw(struct __sk_buff *ctx)
+{
+	if (ctx->len)
+		bpf_throw(0);
+	return 0;
+}
+
+SEC("?tc")
+__failure __msg("Unreleased reference")
+int reject_global_subprog_throw_with_reference(struct __sk_buff *ctx)
+{
+	struct foo *f;
+
+	f = bpf_obj_new(typeof(*f));
+	if (!f)
+		return 0;
+	if (ctx->protocol)
+		global_subprog_may_throw(ctx);
+	bpf_obj_drop(f);
 	return 0;
 }
 

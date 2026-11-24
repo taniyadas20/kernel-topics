@@ -51,6 +51,12 @@ properties:
       should not be accessed by the OS. Please see the ../gpio/gpio.txt for more
       information.
 
+patternProperties:
+  "-hog(-[0-9]+)?$":
+    type: object
+    required:
+      - gpio-hog
+
 allOf:
   - $ref: pinctrl.yaml#
 
@@ -80,6 +86,13 @@ $defs:
       output-enable: true
       output-high: true
       output-low: true
+
+      qcom,remote-owned:
+        type: boolean
+        description:
+          Hand the specified pins over to their remote eGPIO owner. Only
+          valid for eGPIO capable pins, and leaves the mux function
+          untouched.
 
     allOf:
       - $ref: pincfg-node.yaml#

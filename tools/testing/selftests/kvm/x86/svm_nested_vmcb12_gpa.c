@@ -9,13 +9,8 @@
 #include "kvm_test_harness.h"
 #include "test_util.h"
 
-
-#define L2_GUEST_STACK_SIZE 64
-
 #define SYNC_GP 101
 #define SYNC_L2_STARTED 102
-
-static unsigned long l2_guest_stack[L2_GUEST_STACK_SIZE];
 
 static void guest_gp_handler(struct ex_regs *regs)
 {
@@ -28,30 +23,30 @@ static void l2_code(void)
 	vmcall();
 }
 
-static void l1_vmrun(struct svm_test_data *svm, u64 gpa)
+static void l1_vmrun(struct svm_test_data *svm, gpa_t gpa)
 {
-	generic_svm_setup(svm, l2_code, &l2_guest_stack[L2_GUEST_STACK_SIZE]);
+	generic_svm_setup(svm, l2_code);
 
 	asm volatile ("vmrun %[gpa]" : : [gpa] "a" (gpa) : "memory");
 }
 
-static void l1_vmload(struct svm_test_data *svm, u64 gpa)
+static void l1_vmload(struct svm_test_data *svm, gpa_t gpa)
 {
-	generic_svm_setup(svm, l2_code, &l2_guest_stack[L2_GUEST_STACK_SIZE]);
+	generic_svm_setup(svm, l2_code);
 
 	asm volatile ("vmload %[gpa]" : : [gpa] "a" (gpa) : "memory");
 }
 
-static void l1_vmsave(struct svm_test_data *svm, u64 gpa)
+static void l1_vmsave(struct svm_test_data *svm, gpa_t gpa)
 {
-	generic_svm_setup(svm, l2_code, &l2_guest_stack[L2_GUEST_STACK_SIZE]);
+	generic_svm_setup(svm, l2_code);
 
 	asm volatile ("vmsave %[gpa]" : : [gpa] "a" (gpa) : "memory");
 }
 
-static void l1_vmexit(struct svm_test_data *svm, u64 gpa)
+static void l1_vmexit(struct svm_test_data *svm, gpa_t gpa)
 {
-	generic_svm_setup(svm, l2_code, &l2_guest_stack[L2_GUEST_STACK_SIZE]);
+	generic_svm_setup(svm, l2_code);
 
 	run_guest(svm->vmcb, svm->vmcb_gpa);
 	GUEST_ASSERT(svm->vmcb->control.exit_code == SVM_EXIT_VMMCALL);
@@ -74,7 +69,7 @@ static u64 unmappable_gpa(struct kvm_vcpu *vcpu)
 
 static void test_invalid_vmcb12(struct kvm_vcpu *vcpu)
 {
-	vm_vaddr_t nested_gva = 0;
+	gva_t nested_gva = 0;
 	struct ucall uc;
 
 
@@ -90,7 +85,7 @@ static void test_invalid_vmcb12(struct kvm_vcpu *vcpu)
 
 static void test_unmappable_vmcb12(struct kvm_vcpu *vcpu)
 {
-	vm_vaddr_t nested_gva = 0;
+	gva_t nested_gva = 0;
 
 	vcpu_alloc_svm(vcpu->vm, &nested_gva);
 	vcpu_args_set(vcpu, 2, nested_gva, unmappable_gpa(vcpu));
@@ -103,7 +98,7 @@ static void test_unmappable_vmcb12(struct kvm_vcpu *vcpu)
 static void test_unmappable_vmcb12_vmexit(struct kvm_vcpu *vcpu)
 {
 	struct kvm_x86_state *state;
-	vm_vaddr_t nested_gva = 0;
+	gva_t nested_gva = 0;
 	struct ucall uc;
 
 	/*

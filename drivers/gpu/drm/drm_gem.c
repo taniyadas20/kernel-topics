@@ -232,8 +232,7 @@ void drm_gem_private_object_init(struct drm_device *dev,
 	if (!obj->resv)
 		obj->resv = &obj->_resv;
 
-	if (drm_core_check_feature(dev, DRIVER_GEM_GPUVA))
-		drm_gem_gpuva_init(obj);
+	drm_gem_gpuva_init(obj);
 
 	drm_vma_node_reset(&obj->vma_node);
 	INIT_LIST_HEAD(&obj->lru_node);
@@ -354,8 +353,11 @@ void drm_gem_object_handle_put_unlocked(struct drm_gem_object *obj)
 	}
 	mutex_unlock(&dev->object_name_lock);
 
-	if (final)
+	if (final) {
+		if (obj->funcs->handle_free)
+			obj->funcs->handle_free(obj);
 		drm_gem_object_put(obj);
+	}
 }
 
 /*
@@ -1015,12 +1017,25 @@ err:
 	return ret;
 }
 
+/*
+ * This ioctl is disabled for security reasons but also it failed
+ * to follow process in terms of adding testing in igt and verifying
+ * all the corner cases which made fixing security bugs in it even
+ * harder than necessary.
+ *
+ * To re-enable this ioctl
+ * 1. land working IGT tests in igt-gpu-tools that cover
+ *    all corner cases and race conditions.
+ * 2. handle idr_preload
+ * 3. handle == 0
+ * 4. handle == new_handle semantics definition.
+ */
 int drm_gem_change_handle_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *file_priv)
 {
 	struct drm_gem_change_handle *args = data;
 	struct drm_gem_object *obj;
-	int handle, ret;
+	int new_handle, ret;
 
 	if (!drm_core_check_feature(dev, DRIVER_GEM))
 		return -EOPNOTSUPP;
@@ -1028,33 +1043,37 @@ int drm_gem_change_handle_ioctl(struct drm_device *dev, void *data,
 	/* idr_alloc() limitation. */
 	if (args->new_handle > INT_MAX)
 		return -EINVAL;
-	handle = args->new_handle;
+	new_handle = args->new_handle;
 
-	obj = drm_gem_object_lookup(file_priv, args->handle);
-	if (!obj)
-		return -ENOENT;
-
-	if (args->handle == handle) {
-		ret = 0;
-		goto out;
-	}
+	if (args->handle == new_handle)
+		return 0;
 
 	mutex_lock(&file_priv->prime.lock);
-
 	spin_lock(&file_priv->table_lock);
-	ret = idr_alloc(&file_priv->object_idr, obj, handle, handle + 1,
+	ret = idr_alloc(&file_priv->object_idr, NULL, new_handle, new_handle + 1,
 			GFP_NOWAIT);
-	spin_unlock(&file_priv->table_lock);
 
-	if (ret < 0)
+	if (ret < 0) {
+		spin_unlock(&file_priv->table_lock);
 		goto out_unlock;
+	}
+
+	obj = idr_replace(&file_priv->object_idr, NULL, args->handle);
+	if (IS_ERR_OR_NULL(obj)) {
+		idr_remove(&file_priv->object_idr, new_handle);
+		spin_unlock(&file_priv->table_lock);
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+	spin_unlock(&file_priv->table_lock);
 
 	if (obj->dma_buf) {
 		ret = drm_prime_add_buf_handle(&file_priv->prime, obj->dma_buf,
-					       handle);
+					       new_handle);
 		if (ret < 0) {
 			spin_lock(&file_priv->table_lock);
-			idr_remove(&file_priv->object_idr, handle);
+			idr_remove(&file_priv->object_idr, new_handle);
+			idr_replace(&file_priv->object_idr, obj, args->handle);
 			spin_unlock(&file_priv->table_lock);
 			goto out_unlock;
 		}
@@ -1066,12 +1085,12 @@ int drm_gem_change_handle_ioctl(struct drm_device *dev, void *data,
 
 	spin_lock(&file_priv->table_lock);
 	idr_remove(&file_priv->object_idr, args->handle);
+	obj = idr_replace(&file_priv->object_idr, obj, new_handle);
 	spin_unlock(&file_priv->table_lock);
+	WARN_ON(obj != NULL);
 
 out_unlock:
 	mutex_unlock(&file_priv->prime.lock);
-out:
-	drm_gem_object_put(obj);
 
 	return ret;
 }
@@ -1235,7 +1254,7 @@ int drm_gem_mmap_obj(struct drm_gem_object *obj, unsigned long obj_size,
 		}
 
 		vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-		vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+		vma->vm_page_prot = pgprot_writecombine(vma_get_page_prot(vma));
 		vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
 	}
 
@@ -1541,12 +1560,10 @@ EXPORT_SYMBOL(drm_gem_unlock_reservations);
  * drm_gem_lru_init - initialize a LRU
  *
  * @lru: The LRU to initialize
- * @lock: The lock protecting the LRU
  */
 void
-drm_gem_lru_init(struct drm_gem_lru *lru, struct mutex *lock)
+drm_gem_lru_init(struct drm_gem_lru *lru)
 {
-	lru->lock = lock;
 	lru->count = 0;
 	INIT_LIST_HEAD(&lru->list);
 }
@@ -1571,14 +1588,10 @@ drm_gem_lru_remove_locked(struct drm_gem_object *obj)
 void
 drm_gem_lru_remove(struct drm_gem_object *obj)
 {
-	struct drm_gem_lru *lru = obj->lru;
-
-	if (!lru)
-		return;
-
-	mutex_lock(lru->lock);
-	drm_gem_lru_remove_locked(obj);
-	mutex_unlock(lru->lock);
+	mutex_lock(&obj->dev->gem_lru_mutex);
+	if (obj->lru)
+		drm_gem_lru_remove_locked(obj);
+	mutex_unlock(&obj->dev->gem_lru_mutex);
 }
 EXPORT_SYMBOL(drm_gem_lru_remove);
 
@@ -1593,7 +1606,7 @@ EXPORT_SYMBOL(drm_gem_lru_remove);
 void
 drm_gem_lru_move_tail_locked(struct drm_gem_lru *lru, struct drm_gem_object *obj)
 {
-	lockdep_assert_held_once(lru->lock);
+	lockdep_assert_held_once(&obj->dev->gem_lru_mutex);
 
 	if (obj->lru)
 		drm_gem_lru_remove_locked(obj);
@@ -1617,9 +1630,9 @@ EXPORT_SYMBOL(drm_gem_lru_move_tail_locked);
 void
 drm_gem_lru_move_tail(struct drm_gem_lru *lru, struct drm_gem_object *obj)
 {
-	mutex_lock(lru->lock);
+	mutex_lock(&obj->dev->gem_lru_mutex);
 	drm_gem_lru_move_tail_locked(lru, obj);
-	mutex_unlock(lru->lock);
+	mutex_unlock(&obj->dev->gem_lru_mutex);
 }
 EXPORT_SYMBOL(drm_gem_lru_move_tail);
 
@@ -1633,26 +1646,26 @@ EXPORT_SYMBOL(drm_gem_lru_move_tail);
  * of the shrink callback to check for this (ie. dma_resv_test_signaled())
  * or if necessary block until the buffer becomes idle.
  *
+ * @dev: DRM device the LRU belongs to
  * @lru: The LRU to scan
  * @nr_to_scan: The number of pages to try to reclaim
  * @remaining: The number of pages left to reclaim, should be initialized by caller
  * @shrink: Callback to try to shrink/reclaim the object.
- * @ticket: Optional ww_acquire_ctx context to use for locking
  */
 unsigned long
-drm_gem_lru_scan(struct drm_gem_lru *lru,
+drm_gem_lru_scan(struct drm_device *dev,
+		 struct drm_gem_lru *lru,
 		 unsigned int nr_to_scan,
 		 unsigned long *remaining,
-		 bool (*shrink)(struct drm_gem_object *obj, struct ww_acquire_ctx *ticket),
-		 struct ww_acquire_ctx *ticket)
+		 bool (*shrink)(struct drm_gem_object *obj))
 {
 	struct drm_gem_lru still_in_lru;
 	struct drm_gem_object *obj;
 	unsigned freed = 0;
 
-	drm_gem_lru_init(&still_in_lru, lru->lock);
+	drm_gem_lru_init(&still_in_lru);
 
-	mutex_lock(lru->lock);
+	mutex_lock(&dev->gem_lru_mutex);
 
 	while (freed < nr_to_scan) {
 		obj = list_first_entry_or_null(&lru->list, typeof(*obj), lru_node);
@@ -1675,22 +1688,19 @@ drm_gem_lru_scan(struct drm_gem_lru *lru,
 		 * rest of the loop body, to reduce contention with other
 		 * code paths that need the LRU lock
 		 */
-		mutex_unlock(lru->lock);
-
-		if (ticket)
-			ww_acquire_init(ticket, &reservation_ww_class);
+		mutex_unlock(&dev->gem_lru_mutex);
 
 		/*
 		 * Note that this still needs to be trylock, since we can
 		 * hit shrinker in response to trying to get backing pages
 		 * for this obj (ie. while it's lock is already held)
 		 */
-		if (!ww_mutex_trylock(&obj->resv->lock, ticket)) {
+		if (!ww_mutex_trylock(&obj->resv->lock, NULL)) {
 			*remaining += obj->size >> PAGE_SHIFT;
 			goto tail;
 		}
 
-		if (shrink(obj, ticket)) {
+		if (shrink(obj)) {
 			freed += obj->size >> PAGE_SHIFT;
 
 			/*
@@ -1700,16 +1710,23 @@ drm_gem_lru_scan(struct drm_gem_lru *lru,
 			 */
 			WARN_ON(obj->lru == &still_in_lru);
 			WARN_ON(obj->lru == lru);
+		} else if (obj->lru == &still_in_lru) {
+			/*
+			 * If the object wasn't moved and wasn't shrunk either,
+			 * it's still remaining as reclaimable. Note that
+			 * obj->lru is supposed to be checked with the LRU lock
+			 * held for an accurate result, but we don't care about
+			 * accuracy here. Worst thing that could happen is an
+			 * extra scan.
+			 */
+			*remaining += obj->size >> PAGE_SHIFT;
 		}
 
 		dma_resv_unlock(obj->resv);
 
-		if (ticket)
-			ww_acquire_fini(ticket);
-
 tail:
 		drm_gem_object_put(obj);
-		mutex_lock(lru->lock);
+		mutex_lock(&dev->gem_lru_mutex);
 	}
 
 	/*
@@ -1721,7 +1738,7 @@ tail:
 	list_splice_tail(&still_in_lru.list, &lru->list);
 	lru->count += still_in_lru.count;
 
-	mutex_unlock(lru->lock);
+	mutex_unlock(&dev->gem_lru_mutex);
 
 	return freed;
 }

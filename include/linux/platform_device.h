@@ -11,6 +11,7 @@
 #define _PLATFORM_DEVICE_H_
 
 #include <linux/device.h>
+#include <linux/device-id/platform.h>
 
 #define PLATFORM_DEVID_NONE	(-1)
 #define PLATFORM_DEVID_AUTO	(-2)
@@ -18,7 +19,8 @@
 struct irq_affinity;
 struct mfd_cell;
 struct property_entry;
-struct platform_device_id;
+struct device_node;
+struct fwnode_handle;
 
 struct platform_device {
 	const char	*name;
@@ -262,6 +264,12 @@ extern int platform_device_add_resources(struct platform_device *pdev,
 					 unsigned int num);
 extern int platform_device_add_data(struct platform_device *pdev,
 				    const void *data, size_t size);
+void platform_device_set_of_node(struct platform_device *pdev,
+				 struct device_node *np);
+void platform_device_set_fwnode(struct platform_device *pdev,
+				struct fwnode_handle *fwnode);
+void platform_device_set_of_node_from_dev(struct platform_device *pdev,
+					  const struct device *dev2);
 extern int platform_device_add(struct platform_device *pdev);
 extern void platform_device_del(struct platform_device *pdev);
 extern void platform_device_put(struct platform_device *pdev);
@@ -293,18 +301,19 @@ struct platform_driver {
  * use a macro to avoid include chaining to get THIS_MODULE
  */
 #define platform_driver_register(drv) \
-	__platform_driver_register(drv, THIS_MODULE)
+	__platform_driver_register(drv, THIS_MODULE, KBUILD_MODNAME)
 extern int __platform_driver_register(struct platform_driver *,
-					struct module *);
+					struct module *, const char *mod_name);
 extern void platform_driver_unregister(struct platform_driver *);
 
 /* non-hotpluggable platform devices may use this so that probe() and
  * its support may live in __init sections, conserving runtime memory.
  */
 #define platform_driver_probe(drv, probe) \
-	__platform_driver_probe(drv, probe, THIS_MODULE)
+	__platform_driver_probe(drv, probe, THIS_MODULE, KBUILD_MODNAME)
 extern int __platform_driver_probe(struct platform_driver *driver,
-		int (*probe)(struct platform_device *), struct module *module);
+		int (*probe)(struct platform_device *), struct module *module,
+		const char *mod_name);
 
 static inline void *platform_get_drvdata(const struct platform_device *pdev)
 {
@@ -334,6 +343,19 @@ static inline void platform_set_drvdata(struct platform_device *pdev,
  */
 #define builtin_platform_driver(__platform_driver) \
 	builtin_driver(__platform_driver, platform_driver_register)
+
+/*
+ * subsys_platform_driver() - Helper macro for drivers that don't do anything
+ * special in module init/exit but need to register earlier, at
+ * subsys_initcall level, when built in.  This eliminates a lot of
+ * boilerplate.  Each driver may only use this macro once, and calling it
+ * replaces module_init() and module_exit().  This is meant to be a parallel
+ * of module_platform_driver() above, but with the init call promoted to
+ * subsys_initcall() so built-in providers are available earlier during boot.
+ */
+#define subsys_platform_driver(__platform_driver) \
+	subsys_driver(__platform_driver, platform_driver_register, \
+			platform_driver_unregister)
 
 /* module_platform_driver_probe() - Helper macro for drivers that don't do
  * anything special in module init/exit.  This eliminates a lot of
@@ -367,20 +389,37 @@ static int __init __platform_driver##_init(void) \
 } \
 device_initcall(__platform_driver##_init); \
 
+/*
+ * subsys_platform_driver_probe() - Helper macro for drivers that don't do
+ * anything special in device init and have no exit, but need to register
+ * earlier, at subsys_initcall level.  This eliminates some boilerplate.  Each
+ * driver may only use this macro once, and using it replaces subsys_initcall.
+ * This is meant to be a parallel of builtin_platform_driver_probe above, but
+ * with the init call promoted to subsys_initcall so the provider is available
+ * earlier during boot.
+ */
+#define subsys_platform_driver_probe(__platform_driver, __platform_probe) \
+static int __init __platform_driver##_init(void) \
+{ \
+	return platform_driver_probe(&(__platform_driver), \
+				     __platform_probe);    \
+} \
+subsys_initcall(__platform_driver##_init) \
+
 #define platform_create_bundle(driver, probe, res, n_res, data, size) \
-	__platform_create_bundle(driver, probe, res, n_res, data, size, THIS_MODULE)
+	__platform_create_bundle(driver, probe, res, n_res, data, size, THIS_MODULE, KBUILD_MODNAME)
 extern struct platform_device *__platform_create_bundle(
 	struct platform_driver *driver, int (*probe)(struct platform_device *),
 	struct resource *res, unsigned int n_res,
-	const void *data, size_t size, struct module *module);
+	const void *data, size_t size, struct module *module, const char *mod_name);
 
 int __platform_register_drivers(struct platform_driver * const *drivers,
-				unsigned int count, struct module *owner);
+				unsigned int count, struct module *owner, const char *mod_name);
 void platform_unregister_drivers(struct platform_driver * const *drivers,
 				 unsigned int count);
 
 #define platform_register_drivers(drivers, count) \
-	__platform_register_drivers(drivers, count, THIS_MODULE)
+	__platform_register_drivers(drivers, count, THIS_MODULE, KBUILD_MODNAME)
 
 #ifdef CONFIG_SUSPEND
 extern int platform_pm_suspend(struct device *dev);

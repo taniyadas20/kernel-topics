@@ -188,10 +188,12 @@ static bool smc_hs_congested(const struct sock *sk)
 
 struct smc_hashinfo smc_v4_hashinfo = {
 	.lock = __RW_LOCK_UNLOCKED(smc_v4_hashinfo.lock),
+	.ht = HLIST_HEAD_INIT,
 };
 
 struct smc_hashinfo smc_v6_hashinfo = {
 	.lock = __RW_LOCK_UNLOCKED(smc_v6_hashinfo.lock),
+	.ht = HLIST_HEAD_INIT,
 };
 
 int smc_hash_sk(struct sock *sk)
@@ -407,13 +409,13 @@ void smc_sk_init(struct net *net, struct sock *sk, int protocol)
 				      "sk_lock-AF_SMC", &smc_key);
 	spin_lock_init(&smc->accept_q_lock);
 	spin_lock_init(&smc->conn.send_lock);
-	sk->sk_prot->hash(sk);
 	mutex_init(&smc->clcsock_release_lock);
 	smc_init_saved_callbacks(smc);
 	smc->limit_smc_hs = net->smc.limit_smc_hs;
 	smc->use_fallback = false; /* assume rdma capability first */
 	smc->fallback_rsn = 0;
 	smc_close_init(smc);
+	sk->sk_prot->hash(sk);
 }
 
 static struct sock *smc_sock_alloc(struct net *net, struct socket *sock,
@@ -663,8 +665,10 @@ static int smcr_clnt_conf_first_link(struct smc_sock *smc)
 	if (rc < 0)
 		return SMC_CLC_DECL_TIMEOUT_CL;
 
+	down_write(&link->lgr->llc_conf_mutex);
 	smc_llc_link_active(link);
 	smcr_lgr_set_type(link->lgr, SMC_LGR_SINGLE);
+	up_write(&link->lgr->llc_conf_mutex);
 
 	if (link->lgr->max_links > 1) {
 		/* optional 2nd link, receive ADD LINK request from server */
@@ -680,7 +684,9 @@ static int smcr_clnt_conf_first_link(struct smc_sock *smc)
 			return rc;
 		}
 		smc_llc_flow_qentry_clr(&link->lgr->llc_flow_lcl);
+		down_write(&link->lgr->llc_conf_mutex);
 		smc_llc_cli_add_link(link, qentry);
+		up_write(&link->lgr->llc_conf_mutex);
 	}
 	return 0;
 }
@@ -1400,7 +1406,8 @@ smc_v2_determine_accepted_chid(struct smc_clc_msg_accept_confirm *aclc,
 	int i;
 
 	for (i = 0; i < ini->ism_offered_cnt + 1; i++) {
-		if (ini->ism_chid[i] == ntohs(aclc->d1.chid)) {
+		if (ini->ism_dev[i] &&
+		    ini->ism_chid[i] == ntohs(aclc->d1.chid)) {
 			ini->ism_selected = i;
 			return 0;
 		}
@@ -1628,12 +1635,8 @@ static void smc_connect_work(struct work_struct *work)
 	lock_sock(&smc->sk);
 	if (rc != 0 || smc->sk.sk_err) {
 		smc->sk.sk_state = SMC_CLOSED;
-		if (rc == -EPIPE || rc == -EAGAIN)
-			smc->sk.sk_err = EPIPE;
-		else if (rc == -ECONNREFUSED)
-			smc->sk.sk_err = ECONNREFUSED;
-		else if (signal_pending(current))
-			smc->sk.sk_err = -sock_intr_errno(timeo);
+		if (!smc->sk.sk_err)
+			smc->sk.sk_err = (rc == -EAGAIN) ? EPIPE : -rc;
 		sock_put(&smc->sk); /* passive closing */
 		goto out;
 	}
@@ -1910,8 +1913,10 @@ static int smcr_serv_conf_first_link(struct smc_sock *smc)
 	/* confirm_rkey is implicit on 1st contact */
 	smc->conn.rmb_desc->is_conf_rkey = true;
 
+	down_write(&link->lgr->llc_conf_mutex);
 	smc_llc_link_active(link);
 	smcr_lgr_set_type(link->lgr, SMC_LGR_SINGLE);
+	up_write(&link->lgr->llc_conf_mutex);
 
 	if (link->lgr->max_links > 1) {
 		down_write(&link->lgr->llc_conf_mutex);
@@ -1932,11 +1937,12 @@ static void smc_listen_out(struct smc_sock *new_smc)
 		atomic_dec(&lsmc->queued_smc_hs);
 
 	release_sock(newsmcsk); /* lock in smc_listen_work() */
+	lock_sock_nested(&lsmc->sk, SINGLE_DEPTH_NESTING);
 	if (lsmc->sk.sk_state == SMC_LISTEN) {
-		lock_sock_nested(&lsmc->sk, SINGLE_DEPTH_NESTING);
 		smc_accept_enqueue(&lsmc->sk, newsmcsk);
 		release_sock(&lsmc->sk);
 	} else { /* no longer listening */
+		release_sock(&lsmc->sk);
 		smc_close_non_accepted(newsmcsk);
 	}
 
@@ -2784,6 +2790,7 @@ int smc_getname(struct socket *sock, struct sockaddr *addr,
 		int peer)
 {
 	struct smc_sock *smc;
+	int rc = -EBADF;
 
 	if (peer && (sock->sk->sk_state != SMC_ACTIVE) &&
 	    (sock->sk->sk_state != SMC_APPCLOSEWAIT1))
@@ -2791,7 +2798,11 @@ int smc_getname(struct socket *sock, struct sockaddr *addr,
 
 	smc = smc_sk(sock->sk);
 
-	return smc->clcsock->ops->getname(smc->clcsock, addr, peer);
+	mutex_lock(&smc->clcsock_release_lock);
+	if (smc->clcsock)
+		rc = smc->clcsock->ops->getname(smc->clcsock, addr, peer);
+	mutex_unlock(&smc->clcsock_release_lock);
+	return rc;
 }
 
 int smc_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
@@ -2919,7 +2930,7 @@ __poll_t smc_poll(struct file *file, struct socket *sock,
 				mask |= EPOLLOUT | EPOLLWRNORM;
 			} else {
 				sk_set_bit(SOCKWQ_ASYNC_NOSPACE, sk);
-				set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
+				sk_set_nospace(sk);
 
 				if (sk->sk_state != SMC_INIT) {
 					/* Race breaker the same way as tcp_poll(). */
@@ -3058,18 +3069,17 @@ static int __smc_setsockopt(struct socket *sock, int level, int optname,
 
 	smc = smc_sk(sk);
 
+	/* pre-fetch user data outside the lock */
+	if (optname == SMC_LIMIT_HS) {
+		if (optlen < sizeof(int))
+			return -EINVAL;
+		if (copy_from_sockptr(&val, optval, sizeof(int)))
+			return -EFAULT;
+	}
+
 	lock_sock(sk);
 	switch (optname) {
 	case SMC_LIMIT_HS:
-		if (optlen < sizeof(int)) {
-			rc = -EINVAL;
-			break;
-		}
-		if (copy_from_sockptr(&val, optval, sizeof(int))) {
-			rc = -EFAULT;
-			break;
-		}
-
 		smc->limit_smc_hs = !!val;
 		rc = 0;
 		break;
@@ -3142,7 +3152,8 @@ int smc_setsockopt(struct socket *sock, int level, int optname,
 			if (val) {
 				SMC_STAT_INC(smc, ndly_cnt);
 				smc_tx_pending(&smc->conn);
-				cancel_delayed_work(&smc->conn.tx_work);
+				if (cancel_delayed_work(&smc->conn.tx_work))
+					sock_put(sk);
 			}
 		}
 		break;
@@ -3153,7 +3164,8 @@ int smc_setsockopt(struct socket *sock, int level, int optname,
 			if (!val) {
 				SMC_STAT_INC(smc, cork_cnt);
 				smc_tx_pending(&smc->conn);
-				cancel_delayed_work(&smc->conn.tx_work);
+				if (cancel_delayed_work(&smc->conn.tx_work))
+					sock_put(sk);
 			}
 		}
 		break;
@@ -3234,7 +3246,8 @@ int smc_ioctl(struct socket *sock, unsigned int cmd,
 			return -EINVAL;
 		}
 		if (smc->sk.sk_state == SMC_INIT ||
-		    smc->sk.sk_state == SMC_CLOSED)
+		    smc->sk.sk_state == SMC_CLOSED ||
+		    !READ_ONCE(smc->conn.sndbuf_desc))
 			answ = 0;
 		else
 			answ = smc->conn.sndbuf_desc->len -
@@ -3521,8 +3534,6 @@ static int __init smc_init(void)
 		pr_err("%s: sock_register fails with %d\n", __func__, rc);
 		goto out_proto6;
 	}
-	INIT_HLIST_HEAD(&smc_v4_hashinfo.ht);
-	INIT_HLIST_HEAD(&smc_v6_hashinfo.ht);
 
 	rc = smc_ib_register_client();
 	if (rc) {
